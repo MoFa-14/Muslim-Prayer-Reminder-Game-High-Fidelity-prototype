@@ -1,0 +1,718 @@
+// Including necessary libraries
+#include <LiquidCrystal.h>       // Library for controlling LCD displays
+#include <WiFi.h>                // Library for WiFi functionality on ESP32
+#include <NTPClient.h>           // Library for getting time from NTP servers
+#include <WiFiUdp.h>             // UDP library required for NTP client
+#include <time.h>                // Standard C time library
+#include <HTTPClient.h>          // Library for making HTTP requests
+#include <ArduinoJson.h>         // Library for parsing JSON data
+#include <sys/time.h>            // System time library
+
+// Initialize LCD with the pins used (RS, E, D4-D7)
+LiquidCrystal lcd(8, 9, 10, 11, 12, 13);
+
+// Define the pin for the buzzer
+const int buzzerPin = 5;         // Buzzer connected to GPIO pin 5
+
+// WiFi credentials for connecting to the internet
+const char* ssid = "OPPO Reno12 F 5G";       // WiFi network name
+const char* password = "Mohammad Faraj";     // WiFi password
+
+// Initialize NTP client for getting accurate time
+WiFiUDP ntpUDP;                  // UDP instance for NTP client
+NTPClient timeClient(ntpUDP, "uk.pool.ntp.org", 0, 60000);  // NTP client using UK server, no offset, 60s update interval
+
+// Setting up location coordinates for prayer time calculation
+const double LATITUDE = 51.5074;   // London latitude
+const double LONGITUDE = -0.1278;  // London longitude
+String apiUrl = "http://api.aladhan.com/v1/timings/";  // API endpoint for prayer times
+
+// Variables for storing prayer information
+String prayerNames[6] = {"Fajr", "Sunrise", "Dhuhr", "Asr", "Maghrib", "Isha"};  // Names of the prayers
+int prayerTimes[6] = {0, 0, 0, 0, 0, 0}; // Times stored as minutes since midnight
+int nextPrayerIndex = -1;        // Index of the next prayer (-1 means not calculated yet)
+unsigned long lastPrayerUpdate = 0;  // Timestamp of last prayer time update
+int displayState = 0;            // Current display mode (0-2)
+unsigned long lastSwitchTime = 0;    // Timestamp of last display switch
+int currentTimeOffset = 0;       // Store BST/GMT offset in seconds
+bool prayedToday[5] = {false};   // Tracking which prayers were prayed today (excluding Sunrise)
+int score = 0;                   // Prayer score counter
+
+// Button configuration
+const int buttonPin = 4;         // Button connected to GPIO pin 4
+bool lastButtonState = HIGH;     // Track button state for edge detection
+
+// Variables for buzzer notifications
+unsigned long lastBeepCheck = 0;     // Time of last notification check
+bool alreadyNotified[4] = {false, false, false, false}; // Flags for different notifications: 15min, 1h, half-time, prayer time
+
+// Function declarations
+void getUTCTime(int &year, int &month, int &day, int &hour);  // Get current UTC time components
+int lastSundayOfMonth(int year, int month);   // Calculate the date of the last Sunday of a month
+int daysInMonth(int year, int month);         // Calculate days in a specific month
+int dayOfWeek(int y, int m, int d);           // Calculate day of week (0=Sunday)
+bool checkBST();                              // Check if British Summer Time is active
+void showUKTime();                            // Display current time on LCD
+void showPrayerCountdown();                   // Display countdown to next prayer
+void showPrayerAsk();                         // Display prayer confirmation screen
+void calculateNextPrayer();                   // Calculate the next upcoming prayer
+bool fetchPrayerTimes();                      // Get prayer times from API
+int convertTimeToMinutes(String timeStr);     // Convert time string to minutes
+
+void setup() {
+  Serial.begin(115200);          // Initialize serial communication for debugging
+  lcd.begin(16, 2);              // Initialize LCD with 16 columns and 2 rows
+  pinMode(buttonPin, INPUT_PULLUP); // Set button pin as input with internal pull-up
+  pinMode(buzzerPin, OUTPUT);    // Set buzzer pin as output
+  digitalWrite(buzzerPin, LOW);  // Ensure buzzer is off initially
+  
+  // Connect to Wi-Fi network
+  lcd.print("Connecting Wi-Fi...");  // Show connection message on LCD
+  WiFi.begin(ssid, password);    // Start WiFi connection
+  
+  int retries = 0;               // Counter for connection attempts
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {  // Wait for connection with timeout
+    delay(500);                  // Half-second delay between attempts
+    lcd.print(".");              // Add dots to show progress
+    retries++;                   // Increment retry counter
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {  // Check if connection successful
+    timeClient.begin();          // Initialize the NTP client
+    lcd.clear();                 // Clear the LCD
+    lcd.print("Wi-Fi Connected!");  // Show success message
+    delay(1000);                 // Wait 1 second
+    
+    // Update time with BST/GMT detection
+    timeClient.update();         // Get time from NTP server
+    bool isBST = checkBST();     // Check if British Summer Time is active
+    currentTimeOffset = isBST ? 3600 : 0;  // Set offset (3600 seconds = 1 hour for BST)
+    timeClient.setTimeOffset(currentTimeOffset);  // Apply offset to NTP client
+    
+    // Try fetching prayer times up to 3 times
+    bool fetchSuccess = false;   // Flag to track if prayer times were fetched successfully
+    for (int i = 0; i < 3 && !fetchSuccess; i++) {  // Try up to 3 times
+      lcd.clear();               // Clear LCD
+      lcd.print("Fetching prayers");  // Show message
+      lcd.setCursor(0, 1);       // Move to second line
+      lcd.print("Attempt ");     // Show attempt number
+      lcd.print(i+1);            // Current attempt (1-based)
+      fetchSuccess = fetchPrayerTimes();  // Try to get prayer times
+      if (!fetchSuccess) {       // If failed
+        delay(2000);             // Wait 2 seconds before next attempt
+      }
+    }
+    
+    // Initialize prayer status for the day
+    for (int i = 0; i < 5; i++) {  // Loop through all 5 prayers (excluding Sunrise)
+      prayedToday[i] = false;    // Reset all to not prayed
+    }
+    nextPrayerIndex = -1;        // Reset next prayer index
+    calculateNextPrayer();       // Calculate which prayer is next
+
+    // Initialize buzzer notification flags
+    for (int i = 0; i < 4; i++) {  // Loop through all notification types
+      alreadyNotified[i] = false;  // Reset all notification flags
+    }
+    
+    // Play startup sound to indicate everything is ready
+    lcd.clear();                 // Clear LCD
+    lcd.print("System Ready!");  // Show ready message
+    startupSound();              // Play startup melody
+    delay(1000);                 // Wait 1 second
+  } else {
+    lcd.clear();                 // Clear LCD
+    lcd.print("WiFi Failed!");   // Show failure message
+    delay(2000);                 // Wait 2 seconds
+  }
+}
+
+void loop() {
+  timeClient.update();           // Update time from NTP server
+  
+  // Update time offset based on BST/GMT status
+  bool isBST = checkBST();       // Check if British Summer Time is active
+  currentTimeOffset = isBST ? 3600 : 0;  // Set offset accordingly
+  timeClient.setTimeOffset(currentTimeOffset);  // Apply offset to NTP client
+
+  // Update prayer times daily at midnight
+  if (timeClient.getHours() == 0 && timeClient.getMinutes() == 0) {  // If it's midnight
+    if (millis() - lastPrayerUpdate > 86400000) {  // If more than a day since last update (86400000ms = 24h)
+      fetchPrayerTimes();        // Get updated prayer times
+    }
+  }
+
+  // Check if buzzer should sound (check every second)
+  if (millis() - lastBeepCheck > 1000) {  // If more than 1 second since last check
+    checkBuzzerAlerts();         // Check if any alerts should be triggered
+    lastBeepCheck = millis();    // Update last check time
+  }
+
+  // Switch display mode every 5 seconds
+  if (millis() - lastSwitchTime > 5000) {  // If 5 seconds have passed
+    displayState = (displayState + 1) % 3;  // Cycle through 3 display states (0, 1, 2)
+    lastSwitchTime = millis();   // Update last switch time
+    lcd.clear();                 // Clear LCD for new display
+  }
+
+  // Show appropriate display based on current state
+  if (displayState == 0) {       // State 0: Show current time
+    showUKTime();
+  } else if (displayState == 1) {  // State 1: Show countdown to next prayer
+    showPrayerCountdown();
+  } else {                       // State 2: Show prayer confirmation
+    showPrayerAsk();
+  }
+
+  // Handle button presses to confirm prayers
+  int buttonState = digitalRead(buttonPin);  // Read current button state
+  if (buttonState == LOW && lastButtonState == HIGH) {  // If button newly pressed (falling edge)
+    Serial.println("Button pressed");  // Debug message
+    int currentMinutes = timeClient.getHours() * 60 + timeClient.getMinutes();  // Current time in minutes
+    int recentPrayer = -1;       // Index of most recent prayer
+    int maxTime = -1;            // Time of most recent prayer
+    for (int i = 0; i < 6; i++) {  // Check all prayers
+      if (i == 1) continue;      // Skip Sunrise
+      if (prayerTimes[i] <= currentMinutes && prayerTimes[i] > maxTime) {  // If prayer has passed and is more recent
+        maxTime = prayerTimes[i];  // Update most recent time
+        recentPrayer = i;        // Update most recent prayer index
+      }
+    }
+    if (recentPrayer != -1) {    // If a recent prayer was found
+      int prayerIdx = -1;        // Mapping to prayer index in prayedToday array
+      // Convert prayer timings index to prayedToday index
+      if (recentPrayer == 0) prayerIdx = 0;      // Fajr
+      else if (recentPrayer == 2) prayerIdx = 1; // Dhuhr
+      else if (recentPrayer == 3) prayerIdx = 2; // Asr
+      else if (recentPrayer == 4) prayerIdx = 3; // Maghrib
+      else if (recentPrayer == 5) prayerIdx = 4; // Isha
+      if (prayerIdx != -1 && !prayedToday[prayerIdx]) {  // If valid prayer and not already confirmed
+        Serial.print("Marking ");  // Debug message
+        Serial.print(prayerNames[recentPrayer]);  // Print prayer name
+        Serial.println(" as prayed");  // Debug message
+        prayedToday[prayerIdx] = true;  // Mark prayer as prayed
+        score++;                 // Increment prayer score
+      }
+    }
+  }
+  lastButtonState = buttonState;  // Update button state for next iteration
+
+  delay(200);                    // Short delay to reduce LCD flicker and stabilize readings
+}
+
+bool checkBST() {
+  int utcYear, utcMonth, utcDay, utcHour;  // Variables to store UTC time components
+  getUTCTime(utcYear, utcMonth, utcDay, utcHour);  // Get current UTC time
+
+  int bstStartDay = lastSundayOfMonth(utcYear, 3);  // Last Sunday in March
+  int bstEndDay = lastSundayOfMonth(utcYear, 10);   // Last Sunday in October
+
+  bool isBST = false;            // Default to not BST
+  if (utcMonth > 3 && utcMonth < 10) {  // If month is April through September
+    isBST = true;                // Definitely BST
+  } else if (utcMonth == 3) {    // If March
+    if (utcDay > bstStartDay || (utcDay == bstStartDay && utcHour >= 1)) {  // After last Sunday at 1AM
+      isBST = true;              // It's BST
+    }
+  } else if (utcMonth == 10) {   // If October
+    if (utcDay < bstEndDay || (utcDay == bstEndDay && utcHour < 1)) {  // Before last Sunday at 1AM
+      isBST = true;              // Still BST
+    }
+  }
+  return isBST;                  // Return BST status
+}
+
+void showUKTime() {
+  bool isBST = checkBST();       // Check if BST is active
+  
+  lcd.setCursor(0, 0);           // Position cursor at top-left
+  String label = isBST ? "UK Time (BST):" : "UK Time (GMT):";  // Label based on time zone
+  lcd.print(label);              // Display time zone label
+  lcd.setCursor(14, 0);          // Position for score display
+  if (score < 10) lcd.print(" ");  // Add space for single-digit score
+  lcd.print(score);              // Display prayer score
+  
+  lcd.setCursor(0, 1);           // Move to second line
+  lcd.print(timeClient.getHours() < 10 ? "0" : "");  // Add leading zero if needed
+  lcd.print(timeClient.getHours());  // Show hours
+  lcd.print(":");                // Colon separator
+  lcd.print(timeClient.getMinutes() < 10 ? "0" : "");  // Add leading zero if needed
+  lcd.print(timeClient.getMinutes());  // Show minutes
+  lcd.print(":");                // Colon separator
+  lcd.print(timeClient.getSeconds() < 10 ? "0" : "");  // Add leading zero if needed
+  lcd.print(timeClient.getSeconds());  // Show seconds
+}
+
+void showPrayerCountdown() {
+  static unsigned long lastCalculation = 0;  // Track when next prayer was last calculated
+  if (millis() - lastCalculation > 60000 || nextPrayerIndex == -1) {  // Recalculate every minute or if not set
+    calculateNextPrayer();       // Calculate next prayer
+    lastCalculation = millis();  // Update calculation timestamp
+  }
+  
+  lcd.setCursor(0, 0);           // Position cursor at top-left
+  lcd.print("Next Prayer:  ");   // Display header
+  lcd.setCursor(14, 0);          // Position for score display
+  if (score < 10) lcd.print(" ");  // Add space for single-digit score
+  lcd.print(score);              // Display prayer score
+  
+  lcd.setCursor(0, 1);           // Move to second line
+  
+  if (nextPrayerIndex == -1 || prayerTimes[0] == 0) {  // If next prayer not calculated or times not loaded
+    lcd.print("Error.. Restart");  // Show error message
+    return;                      // Exit function
+  }
+
+  int currentMinutes = timeClient.getHours() * 60 + timeClient.getMinutes();  // Current time in minutes
+  int remainingMinutes;          // Minutes until next prayer
+  
+  if (prayerTimes[nextPrayerIndex] > currentMinutes) {  // If next prayer is later today
+    remainingMinutes = prayerTimes[nextPrayerIndex] - currentMinutes;  // Calculate minutes remaining
+  } else {                       // If next prayer is tomorrow
+    remainingMinutes = (24 * 60 - currentMinutes) + prayerTimes[0];  // Calculate minutes until Fajr tomorrow
+  }
+
+  int hours = remainingMinutes / 60;  // Extract hours from minutes
+  int minutes = remainingMinutes % 60;  // Extract remaining minutes
+  
+  lcd.print(prayerNames[nextPrayerIndex]);  // Display next prayer name
+  int padLength = 6 - prayerNames[nextPrayerIndex].length();  // Calculate padding needed
+  if (padLength > 0) {           // If padding needed
+    for (int i = 0; i < padLength; i++) {  // Add spaces to align text
+      lcd.print(" ");
+    }
+  }
+  lcd.print(" ");                // Space after prayer name
+  lcd.print(hours < 10 ? "0" : "");  // Add leading zero if needed
+  lcd.print(hours);              // Display hours
+  lcd.print("h");                // Hours label
+  lcd.print(minutes < 10 ? "0" : "");  // Add leading zero if needed
+  lcd.print(minutes);            // Display minutes
+  lcd.print("m");                // Minutes label
+}
+
+void showPrayerAsk() {
+  lcd.setCursor(0, 0);           // Position cursor at top-left
+  int currentMinutes = timeClient.getHours() * 60 + timeClient.getMinutes();  // Current time in minutes
+  int recentPrayer = -1;         // Index of most recent prayer
+  int maxTime = -1;              // Time of most recent prayer
+  for (int i = 0; i < 6; i++) {  // Check all prayers
+    if (i == 1) continue;        // Skip Sunrise
+    if (prayerTimes[i] <= currentMinutes && prayerTimes[i] > maxTime) {  // If prayer has passed and is more recent
+      maxTime = prayerTimes[i];  // Update most recent time
+      recentPrayer = i;          // Update most recent prayer index
+    }
+  }
+
+  if (recentPrayer != -1) {      // If a recent prayer was found
+    int prayerIdx = -1;          // Mapping to prayer index in prayedToday array
+    // Convert prayer timings index to prayedToday index
+    if (recentPrayer == 0) prayerIdx = 0;      // Fajr
+    else if (recentPrayer == 2) prayerIdx = 1; // Dhuhr
+    else if (recentPrayer == 3) prayerIdx = 2; // Asr
+    else if (recentPrayer == 4) prayerIdx = 3; // Maghrib
+    else if (recentPrayer == 5) prayerIdx = 4; // Isha
+
+    if (prayerIdx != -1 && !prayedToday[prayerIdx]) {  // If valid prayer and not already confirmed
+      String msg = "Prayed " + prayerNames[recentPrayer] + "?";  // Create question message
+      lcd.print(msg.substring(0, 14));  // Display message (truncated if needed)
+      lcd.setCursor(14, 0);       // Position for score display
+      if (score < 10) lcd.print(" ");  // Add space for single-digit score
+      lcd.print(score);           // Display prayer score
+      lcd.setCursor(0, 1);        // Move to second line
+      lcd.print("Press to confirm");  // Show instruction
+    } else {                      // If all recent prayers confirmed
+      lcd.print("All confirmed   ");  // Show all confirmed message
+      lcd.setCursor(14, 0);       // Position for score display
+      if (score < 10) lcd.print(" ");  // Add space for single-digit score
+      lcd.print(score);           // Display prayer score
+      lcd.setCursor(0, 1);        // Move to second line
+      lcd.print("                ");  // Clear second line
+    }
+  } else {                        // If no recent prayer found
+    lcd.print("No recent prayer");  // Show no recent prayer message
+    lcd.setCursor(14, 0);         // Position for score display
+    if (score < 10) lcd.print(" ");  // Add space for single-digit score
+    lcd.print(score);             // Display prayer score
+    lcd.setCursor(0, 1);          // Move to second line
+    lcd.print("                ");  // Clear second line
+  }
+}
+
+void calculateNextPrayer() {
+  // Don't calculate if we don't have valid prayer times yet
+  if (prayerTimes[0] == 0 && prayerTimes[2] == 0) {  // Check if prayer times are loaded
+    nextPrayerIndex = -1;         // Set invalid index
+    return;                       // Exit function
+  }
+  
+  int currentMinutes = timeClient.getHours() * 60 + timeClient.getMinutes();  // Current time in minutes
+  
+  Serial.print("Current time: ");  // Debug message
+  Serial.print(timeClient.getHours());  // Print hours
+  Serial.print(":");              // Colon separator
+  Serial.print(timeClient.getMinutes());  // Print minutes
+  Serial.print(" (");             // Opening parenthesis
+  Serial.print(currentMinutes);   // Print total minutes
+  Serial.println(" minutes)");    // Close with units
+  
+  nextPrayerIndex = -1;           // Reset next prayer index
+  int smallestDifference = 24 * 60;  // Start with maximum possible difference (24 hours)
+  
+  Serial.println("All prayer times:");  // Debug header
+  for (int i = 0; i < 6; i++) {   // Loop through all prayers
+    if (i == 1) continue;         // Skip Sunrise
+    int hours = prayerTimes[i] / 60;  // Convert minutes to hours
+    int mins = prayerTimes[i] % 60;   // Get remaining minutes
+    Serial.print(prayerNames[i]);  // Print prayer name
+    Serial.print(": ");           // Separator
+    Serial.print(hours);          // Print hours
+    Serial.print(":");            // Colon separator
+    Serial.print(mins < 10 ? "0" : "");  // Add leading zero if needed
+    Serial.print(mins);           // Print minutes
+    Serial.print(" (");           // Opening parenthesis
+    Serial.print(prayerTimes[i]); // Print total minutes
+    Serial.println(" minutes)");  // Close with units
+  }
+  
+  for (int i = 0; i < 6; i++) {   // Loop through all prayers
+    if (i == 1) continue;         // Skip Sunrise
+    if (prayerTimes[i] > currentMinutes) {  // If prayer is in the future
+      int difference = prayerTimes[i] - currentMinutes;  // Calculate time difference
+      Serial.print("Prayer ");    // Debug message
+      Serial.print(prayerNames[i]);  // Print prayer name
+      Serial.print(" is in the future, difference: ");  // Debug message
+      Serial.print(difference);   // Print time difference
+      Serial.println(" minutes"); // Close with units
+      
+      if (difference < smallestDifference) {  // If this prayer is sooner than previous
+        smallestDifference = difference;  // Update smallest difference
+        nextPrayerIndex = i;     // Update next prayer index
+        Serial.print("New next prayer: ");  // Debug message
+        Serial.println(prayerNames[i]);  // Print new next prayer
+      }
+    }
+  }
+  
+  if (nextPrayerIndex == -1) {   // If no future prayers found today
+    nextPrayerIndex = 0;         // Set to Fajr (tomorrow)
+    Serial.println("No more prayers today, next is tomorrow's Fajr");  // Debug message
+  }
+}
+
+bool fetchPrayerTimes() {
+  if (WiFi.status() != WL_CONNECTED) return false;  // Ensure WiFi is connected
+
+  time_t now = timeClient.getEpochTime();  // Get current epoch time
+  time_t localNow = now + currentTimeOffset;  // Apply timezone offset
+  struct tm ti;                  // Time structure
+  gmtime_r(&localNow, &ti);      // Convert epoch time to time structure
+  
+  int day = ti.tm_mday;          // Extract day
+  int month = ti.tm_mon + 1;     // Extract month (0-based to 1-based)
+  int year = ti.tm_year + 1900;  // Extract year (years since 1900 to actual year)
+
+  // Format date as DD-MM-YYYY for API request
+  String dayStr = (day < 10 ? "0" : "") + String(day);  // Add leading zero if needed
+  String monthStr = (month < 10 ? "0" : "") + String(month);  // Add leading zero if needed
+  String yearStr = String(year);  // Convert year to string
+  String dateStr = dayStr + "-" + monthStr + "-" + yearStr;  // Combine as DD-MM-YYYY
+
+  Serial.print("Fetching prayer times for date: ");  // Debug message
+  Serial.println(dateStr);       // Print date
+
+  String requestUrl = apiUrl + dateStr + "?latitude=" + String(LATITUDE) + "&longitude=" + String(LONGITUDE) + "&method=2";  // Build API URL
+  
+  Serial.print("API URL: ");     // Debug message
+  Serial.println(requestUrl);    // Print URL
+  
+  HTTPClient http;               // HTTP client for API requests
+  http.begin(requestUrl);        // Start request with URL
+  
+  int httpCode = http.GET();     // Make GET request
+  if (httpCode == HTTP_CODE_OK) {  // If request successful
+    String payload = http.getString();  // Get response body
+    Serial.println("API Response:");  // Debug message
+    Serial.println(payload);     // Print response
+    
+    // Parse JSON response
+    JsonDocument doc;            // JSON document for parsing
+    DeserializationError error = deserializeJson(doc, payload);  // Parse JSON
+    
+    if (error) {                 // If parsing failed
+      Serial.print("JSON Error: ");  // Debug message
+      Serial.println(error.c_str());  // Print error
+      lcd.clear();               // Clear LCD
+      lcd.print("JSON Parse Error");  // Show error
+      delay(2000);               // Wait 2 seconds
+      http.end();                // Close HTTP connection
+      return false;              // Return failure
+    } else {                     // If parsing successful
+      JsonObject data = doc["data"];  // Get data object
+      JsonObject timings = data["timings"];  // Get timings object
+
+      // Verify we got valid data
+      if (!timings.containsKey("Fajr")) {  // Check for required field
+        Serial.println("API response missing prayer times");  // Debug message
+        lcd.clear();             // Clear LCD
+        lcd.print("Invalid API data");  // Show error
+        delay(2000);             // Wait 2 seconds
+        http.end();              // Close HTTP connection
+        return false;            // Return failure
+      }
+
+      Serial.println("Timings from API:");  // Debug message
+      Serial.print("Fajr: ");    // Debug message
+      Serial.println(timings["Fajr"].as<String>());  // Print Fajr time
+      
+      // Convert all prayer times to minutes since midnight
+      prayerTimes[0] = convertTimeToMinutes(timings["Fajr"].as<String>());
+      prayerTimes[1] = convertTimeToMinutes(timings["Sunrise"].as<String>());
+      prayerTimes[2] = convertTimeToMinutes(timings["Dhuhr"].as<String>());
+      prayerTimes[3] = convertTimeToMinutes(timings["Asr"].as<String>());
+      prayerTimes[4] = convertTimeToMinutes(timings["Maghrib"].as<String>());
+      prayerTimes[5] = convertTimeToMinutes(timings["Isha"].as<String>());
+
+      // Validate parsed times
+      bool validTimes = true;    // Flag for validation
+      for (int i = 0; i < 6; i++) {  // Check all prayer times
+        if (prayerTimes[i] <= 0 || prayerTimes[i] >= 24*60) {  // If outside valid range
+          validTimes = false;    // Mark as invalid
+          break;                 // Stop checking
+        }
+      }
+
+      if (!validTimes) {         // If invalid times found
+        Serial.println("Invalid prayer times detected");  // Debug message
+        lcd.clear();             // Clear LCD
+        lcd.print("Invalid times");  // Show error
+        delay(2000);             // Wait 2 seconds
+        http.end();              // Close HTTP connection
+        return false;            // Return failure
+      }
+
+      Serial.println("Converted times in minutes:");  // Debug message
+      for (int i = 0; i < 6; i++) {  // Loop through all prayers
+        Serial.print(prayerNames[i]);  // Print prayer name
+        Serial.print(": ");      // Separator
+        Serial.println(prayerTimes[i]);  // Print minutes
+      }
+      
+      lastPrayerUpdate = millis();  // Update timestamp
+      
+      nextPrayerIndex = -1;      // Reset next prayer index
+      calculateNextPrayer();     // Calculate next prayer
+      
+      // Reset prayedToday flags
+      for (int i = 0; i < 5; i++) {  // Loop through all prayers (excluding Sunrise)
+        prayedToday[i] = false;  // Reset to not prayed
+      }
+      http.end();                // Close HTTP connection
+      return true;               // Return success
+    }
+  } else {                       // If HTTP request failed
+    Serial.print("HTTP Error: ");  // Debug message
+    Serial.println(httpCode);    // Print error code
+    lcd.clear();                 // Clear LCD
+    lcd.print("Prayer Times Error");  // Show error
+    delay(2000);                 // Wait 2 seconds
+    http.end();                  // Close HTTP connection
+    return false;                // Return failure
+  }
+}
+
+int convertTimeToMinutes(String timeStr) {
+  int colonIndex = timeStr.indexOf(':');  // Find position of colon
+  if (colonIndex == -1) {        // If no colon found (invalid format)
+    Serial.print("Invalid time format: ");  // Debug message
+    Serial.println(timeStr);     // Print invalid time
+    return 0;                    // Return 0 (error value)
+  }
+  
+  int spaceIndex = timeStr.indexOf(' ');  // Find position of space (for AM/PM format)
+  String pureTiming;             // String to hold just the time part
+  
+  if (spaceIndex != -1) {        // If space found (has AM/PM)
+    pureTiming = timeStr.substring(0, spaceIndex);  // Extract time part
+  } else {                       // If no space (24-hour format)
+    pureTiming = timeStr;        // Use whole string
+  }
+  
+  colonIndex = pureTiming.indexOf(':');  // Find colon again (may have changed)
+  
+  int hours = pureTiming.substring(0, colonIndex).toInt();  // Extract hours
+  int minutes = pureTiming.substring(colonIndex+1).toInt();  // Extract minutes
+  
+  Serial.print("Converting time: ");  // Debug message
+  Serial.print(pureTiming);      // Print time
+  Serial.print(" to minutes: "); // Debug message
+  Serial.println(hours * 60 + minutes);  // Print converted minutes
+  
+  return hours * 60 + minutes;   // Return time in minutes
+}
+
+void getUTCTime(int &year, int &month, int &day, int &hour) {
+  time_t epochTime = timeClient.getEpochTime();  // Get current epoch time (seconds since Jan 1, 1970)
+  struct tm ptm;                 // Time structure to hold broken-down time
+  gmtime_r(&epochTime, &ptm);    // Convert epoch time to UTC time structure (thread-safe version)
+  year = ptm.tm_year + 1900;     // Year is stored as years since 1900, so add 1900
+  month = ptm.tm_mon + 1;        // Month is 0-based (0-11), so add 1 for conventional format (1-12)
+  day = ptm.tm_mday;             // Day of month (1-31)
+  hour = ptm.tm_hour;            // Hour (0-23)
+}
+
+int lastSundayOfMonth(int year, int month) {
+  int lastDay = daysInMonth(year, month);  // Get last day of the given month
+  for (int day = lastDay; day > 0; day--) {  // Start from last day and work backwards
+    if (dayOfWeek(year, month, day) == 0) {  // If day is Sunday (0)
+      return day;                 // Return this date - it's the last Sunday of the month
+    }
+  }
+  return 0;                       // Return 0 if no Sunday found (shouldn't happen)
+}
+
+int daysInMonth(int year, int month) {
+  if (month == 2) return (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) ? 29 : 28;  // February: 29 days in leap years, 28 otherwise
+  if (month == 4 || month == 6 || month == 9 || month == 11) return 30;  // April, June, September, November: 30 days
+  return 31;                      // All other months: 31 days
+}
+
+int dayOfWeek(int y, int m, int d) {
+  if (m < 3) {                    // Adjust for January and February
+    y--;                          // Treat them as months 13 and 14 of previous year
+    m += 12;                      // Add 12 to month
+  }
+  return (d + (13 * (m + 1) / 5) + y + (y / 4) - (y / 100) + (y / 400)) % 7;  // Zeller's congruence algorithm for day of week
+}
+
+// Different beep patterns
+void slowCalm() {
+  // Slow and calm beep pattern
+  for (int i = 0; i < 2; i++) {   // Loop twice
+    tone(buzzerPin, 880, 300);    // Play A5 note (880Hz) for 300ms
+    delay(500);                   // Wait 500ms between beeps
+  }
+}
+
+void mediumBeep() {
+  // Medium urgency beep pattern 
+  for (int i = 0; i < 3; i++) {   // Loop three times
+    tone(buzzerPin, 1175, 200);   // Play D6 note (1175Hz) for 200ms
+    delay(300);                   // Wait 300ms between beeps
+  }
+}
+
+void urgentBeep() {
+  // More urgent beep pattern
+  for (int i = 0; i < 3; i++) {   // Loop three times
+    tone(buzzerPin, 1760, 100);   // Play A6 note (1760Hz) for 100ms
+    delay(150);                   // Wait 150ms between beeps (faster pace)
+  }
+}
+
+void prayerTimeBeep() {
+  // Prayer time arrival beep - most urgent
+  for (int i = 0; i < 5; i++) {   // Loop five times
+    tone(buzzerPin, 2093, 80);    // Play C7 note (2093Hz) for 80ms
+    delay(100);                   // Wait 100ms
+    tone(buzzerPin, 2637, 80);    // Play E7 note (2637Hz) for 80ms
+    delay(100);                   // Wait 100ms (alternating notes pattern)
+  }
+}
+
+// Check if we need to sound the buzzer
+void checkBuzzerAlerts() {
+  int currentMinutes = timeClient.getHours() * 60 + timeClient.getMinutes();  // Current time in minutes since midnight
+  int timeToNextPrayer;           // Variable to store minutes until next prayer
+  
+  // Calculate time to next prayer
+  if (nextPrayerIndex == -1) return;  // Exit if next prayer index not calculated
+  
+  if (prayerTimes[nextPrayerIndex] > currentMinutes) {  // If next prayer is later today
+    timeToNextPrayer = prayerTimes[nextPrayerIndex] - currentMinutes;  // Simple subtraction
+  } else {                        // If next prayer is tomorrow (Fajr)
+    timeToNextPrayer = (24 * 60 - currentMinutes) + prayerTimes[0];  // Calculate time until tomorrow's Fajr
+  }
+  
+  int prevPrayerIndex = nextPrayerIndex - 1;  // Get previous prayer index
+  if (prevPrayerIndex < 0) prevPrayerIndex = 5;  // Wrap around to Isha if necessary
+  while (prevPrayerIndex == 1) {  // Skip Sunrise as it's not a prayer time
+    prevPrayerIndex--;            // Go to previous prayer
+    if (prevPrayerIndex < 0) prevPrayerIndex = 5;  // Wrap around if needed
+  }
+  
+  int timeSincePrevPrayer;        // Variable to store minutes since previous prayer
+  if (currentMinutes > prayerTimes[prevPrayerIndex]) {  // If previous prayer was today
+    timeSincePrevPrayer = currentMinutes - prayerTimes[prevPrayerIndex];  // Simple subtraction
+  } else {                        // If previous prayer was yesterday
+    timeSincePrevPrayer = currentMinutes + (24 * 60 - prayerTimes[prevPrayerIndex]);  // Calculate time since yesterday's prayer
+  }
+  
+  int totalTimeBetweenPrayers;    // Variable to store minutes between adjacent prayers
+  if (prayerTimes[nextPrayerIndex] > prayerTimes[prevPrayerIndex]) {  // If both prayers on same day
+    totalTimeBetweenPrayers = prayerTimes[nextPrayerIndex] - prayerTimes[prevPrayerIndex];  // Simple subtraction
+  } else {                        // If next prayer is tomorrow
+    totalTimeBetweenPrayers = (24 * 60 - prayerTimes[prevPrayerIndex]) + prayerTimes[nextPrayerIndex];  // Calculate total time span
+  }
+  
+  int halfTimeMark = totalTimeBetweenPrayers / 2;  // Calculate halfway point between prayers
+  
+  // Check if it's prayer time (1-minute window to avoid multiple alerts)
+  if (timeToNextPrayer == 0 && !alreadyNotified[3]) {  // If prayer time now and not yet notified
+    prayerTimeBeep();             // Play prayer time alert
+    alreadyNotified[3] = true;    // Mark prayer time alert as played
+    // Reset other notifications for next prayer cycle
+    alreadyNotified[0] = false;   // Reset 15min notification
+    alreadyNotified[1] = false;   // Reset 1h notification
+    alreadyNotified[2] = false;   // Reset half-time notification
+    Serial.println("BEEP: Prayer time!");  // Debug message
+  } else if (timeToNextPrayer > 1) {  // If not at prayer time anymore
+    alreadyNotified[3] = false;   // Reset prayer time notification for next time
+  }
+  
+  // Check if we've just passed the half-way point and haven't already notified
+  // Only beep for half-time if we haven't prayed the previous prayer yet
+  int prayerIdx = -1;             // Variable to map prayer timing index to prayedToday index
+  // Convert prayer timings index to prayedToday index
+  if (prevPrayerIndex == 0) prayerIdx = 0;      // Fajr
+  else if (prevPrayerIndex == 2) prayerIdx = 1; // Dhuhr
+  else if (prevPrayerIndex == 3) prayerIdx = 2; // Asr
+  else if (prevPrayerIndex == 4) prayerIdx = 3; // Maghrib
+  else if (prevPrayerIndex == 5) prayerIdx = 4; // Isha
+  
+  bool prayedPrevious = (prayerIdx != -1) ? prayedToday[prayerIdx] : false;  // Check if previous prayer was marked as prayed
+  
+  if (timeSincePrevPrayer >= halfTimeMark && timeSincePrevPrayer <= halfTimeMark + 1 && !alreadyNotified[2] && !prayedPrevious) {
+    // If at halfway point, not yet notified, and previous prayer not confirmed
+    slowCalm();                   // Play calm notification
+    alreadyNotified[2] = true;    // Mark half-time alert as played
+    Serial.println("BEEP: Half-time between prayers!");  // Debug message
+  }
+  
+  // Check for 1 hour remaining alert (60 minutes)
+  if (timeToNextPrayer <= 60 && timeToNextPrayer >= 59 && !alreadyNotified[1]) {  // If 1 hour remaining and not yet notified
+    mediumBeep();                 // Play medium-urgency alert
+    alreadyNotified[1] = true;    // Mark 1-hour alert as played
+    Serial.println("BEEP: 1 hour until prayer!");  // Debug message
+  }
+  
+  // Check for 15 minutes remaining alert
+  if (timeToNextPrayer <= 15 && timeToNextPrayer >= 14 && !alreadyNotified[0]) {  // If 15 minutes remaining and not yet notified
+    urgentBeep();                 // Play urgent alert
+    alreadyNotified[0] = true;    // Mark 15-minute alert as played
+    Serial.println("BEEP: 15 minutes until prayer!");  // Debug message
+  }
+}
+
+// Function for startup sound
+void startupSound() {
+  // Ascending tones to indicate successful startup
+  tone(buzzerPin, 523, 150);      // Play C5 note (523Hz) for 150ms
+  delay(200);                     // Wait 200ms
+  tone(buzzerPin, 659, 150);      // Play E5 note (659Hz) for 150ms
+  delay(200);                     // Wait 200ms
+  tone(buzzerPin, 784, 150);      // Play G5 note (784Hz) for 150ms
+  delay(200);                     // Wait 200ms
+  tone(buzzerPin, 1047, 300);     // Play C6 note (1047Hz) for 300ms (longer final note)
+  delay(400);                     // Wait 400ms
+}
